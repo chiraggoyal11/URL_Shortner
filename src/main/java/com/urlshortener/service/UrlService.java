@@ -6,8 +6,11 @@ import com.urlshortener.exception.CustomAliasAlreadyExistsException;
 import com.urlshortener.exception.UrlExpiredException;
 import com.urlshortener.exception.UrlNotFoundException;
 import com.urlshortener.model.Url;
+import com.urlshortener.monitoring.MetricsService;
 import com.urlshortener.repository.UrlRepository;
+import com.urlshortener.security.UrlValidationService;
 import com.urlshortener.util.Base62Encoder;
+import io.micrometer.core.instrument.Timer;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -29,6 +32,8 @@ public class UrlService {
     private final UrlRepository urlRepository;
     private final Base62Encoder base62Encoder;
     private final RedisTemplate<String, String> redisTemplate;
+    private final MetricsService metricsService;
+    private final UrlValidationService urlValidationService;
 
     @Value("${app.base-url:http://localhost:8080}")
     private String baseUrl;
@@ -42,6 +47,9 @@ public class UrlService {
     @Transactional
     public UrlResponse createShortUrl(CreateUrlRequest request) {
         log.info("Creating short URL for: {}", request.getOriginalUrl());
+
+        // Validate URL
+        urlValidationService.validateUrl(request.getOriginalUrl());
 
         // Handle custom alias
         String shortCode;
@@ -82,6 +90,9 @@ public class UrlService {
 
         log.info("Short URL created: {} -> {}", shortCode, url.getOriginalUrl());
 
+        // Track metric
+        metricsService.incrementUrlCreation();
+
         return buildUrlResponse(url);
     }
 
@@ -90,37 +101,47 @@ public class UrlService {
      */
     @Transactional(readOnly = true)
     public String getOriginalUrl(String shortCode) {
+        Timer.Sample sample = metricsService.startTimer();
         log.info("Fetching original URL for short code: {}", shortCode);
 
-        // Try Redis cache first
-        String cacheKey = CACHE_PREFIX + shortCode;
-        String cachedUrl = redisTemplate.opsForValue().get(cacheKey);
+        try {
+            // Try Redis cache first
+            String cacheKey = CACHE_PREFIX + shortCode;
+            String cachedUrl = redisTemplate.opsForValue().get(cacheKey);
 
-        if (cachedUrl != null) {
-            log.info("Cache hit for: {}", shortCode);
+            if (cachedUrl != null) {
+                log.info("Cache hit for: {}", shortCode);
+                metricsService.incrementCacheHit();
+                metricsService.incrementRedirect();
+                // Async increment click count
+                asyncIncrementClickCount(shortCode);
+                return cachedUrl;
+            }
+
+            log.info("Cache miss for: {}", shortCode);
+            metricsService.incrementCacheMiss();
+
+            // Fallback to database
+            Url url = urlRepository.findByShortCode(shortCode)
+                    .orElseThrow(() -> new UrlNotFoundException("Short URL not found: " + shortCode));
+
+            // Check expiry
+            if (url.isExpired()) {
+                throw new UrlExpiredException("This short URL has expired");
+            }
+
+            // Update cache
+            redisTemplate.opsForValue().set(cacheKey, url.getOriginalUrl(), CACHE_TTL_HOURS, TimeUnit.HOURS);
+
+            metricsService.incrementRedirect();
+            
             // Async increment click count
             asyncIncrementClickCount(shortCode);
-            return cachedUrl;
+
+            return url.getOriginalUrl();
+        } finally {
+            metricsService.recordRedirectLatency(sample);
         }
-
-        log.info("Cache miss for: {}", shortCode);
-
-        // Fallback to database
-        Url url = urlRepository.findByShortCode(shortCode)
-                .orElseThrow(() -> new UrlNotFoundException("Short URL not found: " + shortCode));
-
-        // Check expiry
-        if (url.isExpired()) {
-            throw new UrlExpiredException("This short URL has expired");
-        }
-
-        // Update cache
-        redisTemplate.opsForValue().set(cacheKey, url.getOriginalUrl(), CACHE_TTL_HOURS, TimeUnit.HOURS);
-
-        // Async increment click count
-        asyncIncrementClickCount(shortCode);
-
-        return url.getOriginalUrl();
     }
 
     /**
